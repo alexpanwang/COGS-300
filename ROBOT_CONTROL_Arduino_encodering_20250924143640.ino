@@ -15,8 +15,8 @@ int driveDir = 0;   // +1 fwd, -1 back, 0 stop
 int turnBias = 0;   // -1 L, +1 R
 
 // === Direction calibration (set these if wheels act reversed) ===
-bool LEFT_INVERT  = false;   // <-- your case: left was reversed
-bool RIGHT_INVERT = true;  // right looked OK from your report
+bool LEFT_INVERT  = false;
+bool RIGHT_INVERT = true;
 
 // ---- low-level dir setters (respect inversion flags)
 void leftSet(bool fwd) {
@@ -26,12 +26,10 @@ void leftSet(bool fwd) {
 }
 void rightSet(bool fwd) {
   if (RIGHT_INVERT) fwd = !fwd;
-  // your wiring used LOW/HIGH as forward; inversion flag will correct if needed
   if (fwd) { digitalWrite(motor2pin1, LOW);  digitalWrite(motor2pin2, HIGH); }
   else     { digitalWrite(motor2pin1, HIGH); digitalWrite(motor2pin2, LOW);  }
 }
 
-// convenience wrappers
 void leftForward()  { leftSet(true);  }
 void leftBackward() { leftSet(false); }
 void leftStop()     { digitalWrite(motor1pin1, LOW); digitalWrite(motor1pin2, LOW); }
@@ -59,6 +57,10 @@ void setup() {
   pinMode(ENC_L, INPUT_PULLUP); pinMode(ENC_R, INPUT_PULLUP);
   stopAll();
   Serial.begin(115200);
+  
+  // Print header for telemetry
+  Serial.println("=== Robot Telemetry ===");
+  Serial.println("Format: T,time_ms,ticksL,ticksR");
 }
 
 void applyDrive() {
@@ -89,8 +91,8 @@ void loop() {
     char c = (char)Serial.read();
     if (c != '\n' && c != '\r') {
       switch (c) {
-        case 'w': case 'W': driveDir =  1; mode = MODE_DRIVE; break; // W = forward
-        case 's': case 'S': driveDir = -1; mode = MODE_DRIVE; break; // S = backward
+        case 'w': case 'W': driveDir =  1; mode = MODE_DRIVE; break;
+        case 's': case 'S': driveDir = -1; mode = MODE_DRIVE; break;
         case 'a': case 'A': if (mode == MODE_DRIVE) turnBias =  1;   break;
         case 'd': case 'D': if (mode == MODE_DRIVE) turnBias = -1;   break;
         case 'q': case 'Q': mode = MODE_SPIN; turnBias = 0; spinLeft();  break;
@@ -102,7 +104,7 @@ void loop() {
   }
   if (mode == MODE_SPIN && driveDir != 0) mode = MODE_DRIVE;
 
-  // encoder polling
+  // Encoder polling - detect state changes (edges)
   int rl = digitalRead(ENC_L);
   int rr = digitalRead(ENC_R);
   if (rl != prevL) { ticksL++; prevL = rl; }
@@ -110,20 +112,20 @@ void loop() {
 
   applyDrive();
 
-  // telemetry
+  // Telemetry - print every 50ms
   static unsigned long lastT = 0;
   unsigned long now = millis();
   if (now - lastT >= TELEMETRY_MS) {
     lastT = now;
     long dL = ticksL, dR = ticksR;
     ticksL = 0; ticksR = 0;
-    Serial.print("T,"); Serial.print(now);
-    Serial.print(',');  Serial.print(dL);
-    Serial.print(',');  Serial.println(dR);
+    
+    // Print in clean CSV format: T,timestamp,left_ticks,right_ticks
+    // Serial.print("T,");
+    Serial.print(now);
+    Serial.print(',');
+    Serial.print(dL);
+    Serial.print(',');
+    Serial.println(dR);
   }
 }
-
-
-
-
-
