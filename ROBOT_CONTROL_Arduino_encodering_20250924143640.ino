@@ -14,14 +14,32 @@ DriveMode mode = MODE_STOP;
 int driveDir = 0;   // +1 fwd, -1 back, 0 stop
 int turnBias = 0;   // -1 L, +1 R
 
-// left
-void leftForward()  { digitalWrite(motor1pin1, HIGH); digitalWrite(motor1pin2, LOW); }
-void leftBackward() { digitalWrite(motor1pin1, LOW);  digitalWrite(motor1pin2, HIGH); }
-void leftStop()     { digitalWrite(motor1pin1, LOW);  digitalWrite(motor1pin2, LOW); }
-// right (your wiring inversion)
-void rightForward()  { digitalWrite(motor2pin1, LOW);  digitalWrite(motor2pin2, HIGH); }
-void rightBackward() { digitalWrite(motor2pin1, HIGH); digitalWrite(motor2pin2, LOW); }
-void rightStop()     { digitalWrite(motor2pin1, LOW);  digitalWrite(motor2pin2, LOW); }
+// === Direction calibration (set these if wheels act reversed) ===
+bool LEFT_INVERT  = false;   // <-- your case: left was reversed
+bool RIGHT_INVERT = true;  // right looked OK from your report
+
+// ---- low-level dir setters (respect inversion flags)
+void leftSet(bool fwd) {
+  if (LEFT_INVERT) fwd = !fwd;
+  if (fwd) { digitalWrite(motor1pin1, HIGH); digitalWrite(motor1pin2, LOW); }
+  else     { digitalWrite(motor1pin1, LOW);  digitalWrite(motor1pin2, HIGH); }
+}
+void rightSet(bool fwd) {
+  if (RIGHT_INVERT) fwd = !fwd;
+  // your wiring used LOW/HIGH as forward; inversion flag will correct if needed
+  if (fwd) { digitalWrite(motor2pin1, LOW);  digitalWrite(motor2pin2, HIGH); }
+  else     { digitalWrite(motor2pin1, HIGH); digitalWrite(motor2pin2, LOW);  }
+}
+
+// convenience wrappers
+void leftForward()  { leftSet(true);  }
+void leftBackward() { leftSet(false); }
+void leftStop()     { digitalWrite(motor1pin1, LOW); digitalWrite(motor1pin2, LOW); }
+
+void rightForward()  { rightSet(true);  }
+void rightBackward() { rightSet(false); }
+void rightStop()     { digitalWrite(motor2pin1, LOW); digitalWrite(motor2pin2, LOW); }
+
 void stopAll() { leftStop(); rightStop(); }
 void spinLeft()  { leftBackward(); rightForward(); }
 void spinRight() { leftForward();  rightBackward(); }
@@ -30,20 +48,15 @@ void spinRight() { leftForward();  rightBackward(); }
 const uint8_t ENC_L = 10;
 const uint8_t ENC_R = 11;
 
-// edge counters (polling)
 volatile long ticksL = 0, ticksR = 0;
-int prevL = HIGH, prevR = HIGH;           // pullups -> idle HIGH
+int prevL = HIGH, prevR = HIGH;
 
-// telemetry rate
-const unsigned long TELEMETRY_MS = 50;    // 20 Hz
+const unsigned long TELEMETRY_MS = 50;
 
 void setup() {
   pinMode(motor1pin1, OUTPUT); pinMode(motor1pin2, OUTPUT);
   pinMode(motor2pin1, OUTPUT); pinMode(motor2pin2, OUTPUT);
-
-  pinMode(ENC_L, INPUT_PULLUP);
-  pinMode(ENC_R, INPUT_PULLUP);
-
+  pinMode(ENC_L, INPUT_PULLUP); pinMode(ENC_R, INPUT_PULLUP);
   stopAll();
   Serial.begin(115200);
 }
@@ -63,7 +76,7 @@ void applyDrive() {
       bool innerLeft = (turnBias < 0);
       if (HARD_TURN) {
         if (driveDir > 0) { if (innerLeft) leftBackward(); else rightBackward(); }
-        else              { if (innerLeft) leftForward();  else rightForward(); }
+        else              { if (innerLeft) leftForward();  else rightForward();  }
       } else {
         if (innerLeft) leftStop(); else rightStop();
       }
@@ -72,15 +85,14 @@ void applyDrive() {
 }
 
 void loop() {
-  // --- controls from Processing ---
   if (Serial.available() > 0) {
     char c = (char)Serial.read();
     if (c != '\n' && c != '\r') {
       switch (c) {
-        case 'w': case 'W': driveDir =  1; mode = MODE_DRIVE; break; // W = fwd
-        case 's': case 'S': driveDir = -1; mode = MODE_DRIVE; break; // S = back
-        case 'a': case 'A': if (mode == MODE_DRIVE) turnBias = -1;   break;
-        case 'd': case 'D': if (mode == MODE_DRIVE) turnBias =  1;   break;
+        case 'w': case 'W': driveDir =  1; mode = MODE_DRIVE; break; // W = forward
+        case 's': case 'S': driveDir = -1; mode = MODE_DRIVE; break; // S = backward
+        case 'a': case 'A': if (mode == MODE_DRIVE) turnBias =  1;   break;
+        case 'd': case 'D': if (mode == MODE_DRIVE) turnBias = -1;   break;
         case 'q': case 'Q': mode = MODE_SPIN; turnBias = 0; spinLeft();  break;
         case 'e': case 'E': mode = MODE_SPIN; turnBias = 0; spinRight(); break;
         case ' ':           mode = MODE_STOP; driveDir = 0; turnBias = 0; stopAll(); break;
@@ -90,15 +102,15 @@ void loop() {
   }
   if (mode == MODE_SPIN && driveDir != 0) mode = MODE_DRIVE;
 
-  // --- encoder edge counting (poll) ---
+  // encoder polling
   int rl = digitalRead(ENC_L);
   int rr = digitalRead(ENC_R);
-  if (rl != prevL) { ticksL++; prevL = rl; }  // count any change
+  if (rl != prevL) { ticksL++; prevL = rl; }
   if (rr != prevR) { ticksR++; prevR = rr; }
 
   applyDrive();
 
-  // --- telemetry at fixed rate ---
+  // telemetry
   static unsigned long lastT = 0;
   unsigned long now = millis();
   if (now - lastT >= TELEMETRY_MS) {
@@ -110,6 +122,8 @@ void loop() {
     Serial.print(',');  Serial.println(dR);
   }
 }
+
+
 
 
 
