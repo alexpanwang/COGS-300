@@ -298,3 +298,4 @@ String printableName(char c) {
     case ' ':           return "Space (STOP)";
   } return str(c);
 }
+
