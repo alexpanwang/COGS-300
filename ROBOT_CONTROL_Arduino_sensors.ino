@@ -1,235 +1,139 @@
-// ===== DRIVE PINS =====
-int motor1pin1 = 2;
-int motor1pin2 = 3;
-int motor2pin1 = 4;
-int motor2pin2 = 5;
+// ================= Line Following per Rules (3 IR sensors) =================
+// Wiring
+const int IN1 = 6;  // Left forward
+const int IN2 = 3;  // Left backward
+const int IN3 = 8;  // Right forward
+const int IN4 = 5;  // Right backward
 
-// ===== ULTRASONICS =====
-const int trigFront = 6;
-const int echoFront = 7;
-const int trigRight = 8;
-const int echoRight = 9;
+const int IR_C = 2; // Center IR (digital OUT)
+const int IR_L = 7; // Left IR
+const int IR_R = 4; // Right IR
 
-// ===== ENCODERS =====
-const uint8_t ENC_L = 10;
-const uint8_t ENC_R = 11;
+// Most IR boards: HIGH on white, LOW on dark. Flip to false if yours is opposite.
+bool IR_HIGH_MEANS_WHITE = true;
 
-// ===== TURN / SPEED (time-sliced; no hardware PWM) =====
-const unsigned long TURN_PERIOD_MS  = 160;
-const unsigned int  TURN_DUTY_PCT   = 70;
-const bool          HARD_TURN       = true;
-
-const unsigned long SPEED_PERIOD_MS = 60;
-unsigned int        speedDutyPct    = 100;   // manual default = full
-
-// ===== MODES =====
-enum DriveMode { MODE_STOP, MODE_DRIVE, MODE_SPIN };
-enum AutonMode { AUTON_OFF, AUTON_FOLLOW_ME, AUTON_RIGHT_WALL };
-DriveMode mode = MODE_STOP;
-AutonMode auton = AUTON_OFF;
-
-// drive state
-int driveDir = 0;   // +1 fwd, -1 back, 0 stop
-int turnBias = 0;   // -1 L, +1 R
-
-// wheel invert (keep your last working combo)
+// Motor inversion (set true if a side runs opposite)
 bool LEFT_INVERT  = false;
-bool RIGHT_INVERT = true;
+bool RIGHT_INVERT = true;  // keep as before; flip to false if your right side is correct
 
-// encoders
-volatile long ticksL = 0, ticksR = 0;
-int prevL = HIGH, prevR = HIGH;
+// Speed / steering shaping
+const unsigned long SPEED_PERIOD_MS = 50; // software PWM period
+unsigned int BASE_DUTY   = 65;            // 55–75 works well
+const unsigned long TURN_PERIOD_MS = 120; // steering slice period
+unsigned int TURN_WIN_PCT = 65;           // slice window (larger = sharper)
+const bool HARD_TURN = false;             // false=stop inner wheel, true=reverse inner (sharper)
 
-// telemetry timers
-const unsigned long TELEMETRY_MS = 50;  // encoders @20Hz
-const unsigned long ULTRA_MS     = 60;  // ultrasonics ~16Hz
-unsigned long lastTele = 0, lastUltra = 0;
+// Debounce for sensor “hits”
+const uint8_t HIT_PERSIST = 2;
 
-// ===== low-level wheel helpers =====
-void leftSet(bool fwd)  { if (LEFT_INVERT)  fwd = !fwd;
-  if (fwd) { digitalWrite(motor1pin1, HIGH); digitalWrite(motor1pin2, LOW); }
-  else     { digitalWrite(motor1pin1, LOW);  digitalWrite(motor1pin2, HIGH); } }
-void rightSet(bool fwd) { if (RIGHT_INVERT) fwd = !fwd;
-  if (fwd) { digitalWrite(motor2pin1, LOW);  digitalWrite(motor2pin2, HIGH); }
-  else     { digitalWrite(motor2pin1, HIGH); digitalWrite(motor2pin2, LOW);  } }
-
-void leftForward()  { leftSet(true); }
-void leftBackward() { leftSet(false); }
-void leftStop()     { digitalWrite(motor1pin1, LOW); digitalWrite(motor1pin2, LOW); }
-void rightForward()  { rightSet(true); }
-void rightBackward() { rightSet(false); }
-void rightStop()     { digitalWrite(motor2pin1, LOW); digitalWrite(motor2pin2, LOW); }
-void stopAll() { leftStop(); rightStop(); }
-void spinLeft()  { leftBackward(); rightForward(); }
-void spinRight() { leftForward();  rightBackward(); }
-
-// ===== ultrasonic helpers =====
-long echoTimeUS(int trig, int echo, unsigned long to_us=25000UL) {
-  digitalWrite(trig, LOW); delayMicroseconds(2);
-  digitalWrite(trig, HIGH); delayMicroseconds(10);
-  digitalWrite(trig, LOW);
-  return pulseIn(echo, HIGH, to_us);     // timeout safe
+// ---------- Motor helpers ----------
+void leftSet(bool fwd){
+  if (LEFT_INVERT) fwd = !fwd;
+  if (fwd){ digitalWrite(IN1,HIGH); digitalWrite(IN2,LOW); }
+  else    { digitalWrite(IN1,LOW);  digitalWrite(IN2,HIGH); }
 }
-float usToCm(long us) {
-  if (us == 0) return 300.0;             // timeout -> big number
-  return (us * 0.0343f) / 2.0f;
+void rightSet(bool fwd){
+  if (RIGHT_INVERT) fwd = !fwd;
+  if (fwd){ digitalWrite(IN3,HIGH); digitalWrite(IN4,LOW); }
+  else    { digitalWrite(IN3,LOW);  digitalWrite(IN4,HIGH); }
 }
-float readCmMedian3(int trig, int echo) {
-  long a = echoTimeUS(trig, echo);
-  long b = echoTimeUS(trig, echo);
-  long c = echoTimeUS(trig, echo);
-  long m = (a > b) ? ((a < c) ? a : ((b > c) ? b : c))
-                   : ((b < c) ? b : ((a > c) ? a : c));
-  float cm = usToCm(m);
-  if (cm < 2.0) cm = 2.0;
-  if (cm > 300.0) cm = 300.0;
-  return cm;
+void leftForward(){ leftSet(true); }
+void leftBackward(){ leftSet(false); }
+void rightForward(){ rightSet(true); }
+void rightBackward(){ rightSet(false); }
+void leftStop(){ digitalWrite(IN1,LOW); digitalWrite(IN2,LOW); }
+void rightStop(){ digitalWrite(IN3,LOW); digitalWrite(IN4,LOW); }
+void stopAll(){ leftStop(); rightStop(); }
+
+// ---------- IR reads (true = on WHITE) ----------
+inline bool onWhiteRaw(int pin){
+  int v = digitalRead(pin);
+  return IR_HIGH_MEANS_WHITE ? (v==HIGH) : (v==LOW);
 }
+inline bool onC(){ return onWhiteRaw(IR_C); }
+inline bool onL(){ return onWhiteRaw(IR_L); }
+inline bool onR(){ return onWhiteRaw(IR_R); }
 
-// ===== auton controllers =====
-// Follow-Me (front setpoint ~25 cm)
-const float SET_CM_FRONT = 25.0;
-const float KP_FRONT     = 2.5;   // tune 1.5..4.0
+// Simple persistence (debounce)
+uint8_t cHit=0,lHit=0,rHit=0;
+bool C=false,L=false,R=false;
 
-void runFollowMe(float front_cm) {
-  float err = SET_CM_FRONT - front_cm;       // + => too far
-  if (err > 0.5)       driveDir = +1;
-  else if (err < -0.5) driveDir = -1;
-  else                 driveDir = 0;
-
-  float mag = fabs(err);
-  unsigned duty = (unsigned)constrain(mag * 6.0f + 20.0f, 0.0f, 100.0f);
-  speedDutyPct = duty;
-  mode = (driveDir == 0) ? MODE_STOP : MODE_DRIVE;
-  turnBias = 0;                              // straight in this mode
+void updateSensors(){
+  C = onC() ? (cHit=min<uint8_t>(255, cHit+1), true) : (cHit=0, false);
+  L = onL() ? (lHit=min<uint8_t>(255, lHit+1), true) : (lHit=0, false);
+  R = onR() ? (rHit=min<uint8_t>(255, rHit+1), true) : (rHit=0, false);
+  // require small persistence to count as “on”
+  C = (cHit >= HIT_PERSIST);
+  L = (lHit >= HIT_PERSIST);
+  R = (rHit >= HIT_PERSIST);
 }
 
-// Right-Wall (right setpoint ~20 cm)
-const float SET_CM_RIGHT = 20.0;
-const float KP_RIGHT     = 0.12;
-
-unsigned int currentTurnDuty = 0;            // per-cycle bias override
-
-void runRightWall(float right_cm) {
-  float err = SET_CM_RIGHT - right_cm;       // + => too far from wall
-  mode = MODE_DRIVE;
-  driveDir = +1;
-
-  int desiredBias = (err > 0.5f) ? +1 : (err < -0.5f ? -1 : 0); // +1 R, -1 L
-  float mag = min(fabs(err) * KP_RIGHT * 100.0f, 100.0f);
-  unsigned steerDuty = (unsigned)constrain(40.0f + mag * 0.5f, 40.0f, 90.0f);
-
-  turnBias = desiredBias;
-  currentTurnDuty = steerDuty;
-  speedDutyPct = 70;                          // base forward
+// ---------- Drive forward with optional steer bias ----------
+void driveForwardSliced(){
+  unsigned long ts = millis() % SPEED_PERIOD_MS;
+  unsigned long on = (SPEED_PERIOD_MS * BASE_DUTY)/100;
+  if (ts <= on){ leftForward(); rightForward(); }
+  else          { stopAll(); }
 }
 
-// ===== drive applier (time-sliced speed + bias) =====
-void applyDrive() {
-  if (mode == MODE_STOP) { stopAll(); return; }
-  if (mode == MODE_SPIN) { return; }
-
-  unsigned long tSpeed = millis() % SPEED_PERIOD_MS;
-  unsigned long onWin  = (SPEED_PERIOD_MS * speedDutyPct) / 100;
-  if (tSpeed >= onWin) { stopAll(); return; }
-
-  if (driveDir > 0) { leftForward(); rightForward(); }
-  else if (driveDir < 0) { leftBackward(); rightBackward(); }
-  else { stopAll(); return; }
-
-  if (turnBias != 0) {
-    unsigned int biasDuty = (currentTurnDuty > 0) ? currentTurnDuty : TURN_DUTY_PCT;
-    unsigned long tTurn   = millis() % TURN_PERIOD_MS;
-    unsigned long turnWin = (TURN_PERIOD_MS * biasDuty) / 100;
-    if (tTurn < turnWin) {
-      bool innerLeft = (turnBias < 0);
-      if (HARD_TURN) {
-        if (driveDir > 0) { if (innerLeft) leftBackward(); else rightBackward(); }
-        else              { if (innerLeft) leftForward();  else rightForward();  }
-      } else {
-        if (innerLeft) leftStop(); else rightStop();
-      }
+// dir: -1 = steer left, +1 = steer right, 0 = straight
+void steerBias(int dir){
+  if (dir == 0) return;
+  unsigned long tt = millis() % TURN_PERIOD_MS;
+  unsigned long win = (TURN_PERIOD_MS * TURN_WIN_PCT)/100;
+  if (tt < win){
+    bool innerLeft = (dir < 0);
+    if (HARD_TURN){
+      if (innerLeft) leftBackward(); else rightBackward();
+    } else {
+      if (innerLeft) leftStop(); else rightStop();
     }
   }
-  currentTurnDuty = 0;   // reset per-cycle override
 }
 
-void setup() {
-  pinMode(motor1pin1, OUTPUT); pinMode(motor1pin2, OUTPUT);
-  pinMode(motor2pin1, OUTPUT); pinMode(motor2pin2, OUTPUT);
-  pinMode(ENC_L, INPUT_PULLUP); pinMode(ENC_R, INPUT_PULLUP);
-  pinMode(trigFront, OUTPUT); pinMode(echoFront, INPUT);
-  pinMode(trigRight, OUTPUT); pinMode(echoRight, INPUT);
+// ---------- Main behavior (your rules) ----------
+// 1) Move along white line on grey floor.
+// 1.2) Keep center sensor on white; “straighten” if centered.
+// 1.3) If RIGHT sees white, steer RIGHT.
+// 1.4) If LEFT sees white,  steer LEFT.
+// Priority: side sensors override; center keeps straight; if none see white, keep last correction briefly.
+
+int lastDir = 0; // memory when no sensor sees white
+
+void followRulesStep(){
+  updateSensors();
+
+  // Base motion = forward
+  driveForwardSliced();
+
+  // Side sensors override: if R sees white → steer right; if L → steer left
+  if (R && !L){ steerBias(+1); lastDir=+1; return; }
+  if (L && !R){ steerBias(-1); lastDir=-1; return; }
+
+  // If centered on white and sides don’t see white → go straight
+  if (C && !L && !R){ steerBias(0); lastDir=0; return; }
+
+  // If both sides see white (wide/intersection), prefer straight
+  if (L && R){ steerBias(0); lastDir=0; return; }
+
+  // If no sensor currently sees white, nudge toward last known side briefly
+  steerBias(lastDir);
+}
+
+void setup(){
+  pinMode(IN1,OUTPUT); pinMode(IN2,OUTPUT);
+  pinMode(IN3,OUTPUT); pinMode(IN4,OUTPUT);
+
+  pinMode(IR_C,INPUT); pinMode(IR_L,INPUT); pinMode(IR_R,INPUT);
 
   stopAll();
   Serial.begin(115200);
+
+  // Quick note: if turning directions feel inverted:
+  //  - swap LEFT_INVERT/RIGHT_INVERT booleans, or
+  //  - swap IR_HIGH_MEANS_WHITE if your boards read LOW on white.
 }
 
-void loop() {
-  // ---- commands ----
-  if (Serial.available() > 0) {
-    char c = (char)Serial.read();
-    if (c != '\n' && c != '\r') {
-      switch (c) {
-        // manual
-        case 'w': case 'W': auton = AUTON_OFF; speedDutyPct=100; driveDir=+1; mode=MODE_DRIVE; turnBias=0; break;
-        case 's': case 'S': auton = AUTON_OFF; speedDutyPct=100; driveDir=-1; mode=MODE_DRIVE; turnBias=0; break;
-        case 'a': case 'A': if (auton==AUTON_OFF && mode==MODE_DRIVE) turnBias = -1; break; // A = left
-        case 'd': case 'D': if (auton==AUTON_OFF && mode==MODE_DRIVE) turnBias =  1; break; // D = right
-        case 'q': case 'Q': auton = AUTON_OFF; mode=MODE_SPIN; turnBias=0; spinLeft();  break;
-        case 'e': case 'E': auton = AUTON_OFF; mode=MODE_SPIN; turnBias=0; spinRight(); break;
-        case ' ':           auton = AUTON_OFF; mode=MODE_STOP; driveDir=0; turnBias=0; stopAll(); break;
-
-        // auton
-        case 'F': auton = AUTON_FOLLOW_ME;    break;
-        case 'R': auton = AUTON_RIGHT_WALL;   break;
-        case 'X': auton = AUTON_OFF; mode=MODE_STOP; driveDir=0; turnBias=0; stopAll(); break;
-
-        default: break;
-      }
-    }
-  }
-  if (mode == MODE_SPIN && driveDir != 0) mode = MODE_DRIVE;
-
-  // ---- encoders (edge poll) ----
-  int rl = digitalRead(ENC_L);
-  int rr = digitalRead(ENC_R);
-  if (rl != prevL) { ticksL++; prevL = rl; }
-  if (rr != prevR) { ticksR++; prevR = rr; }
-
-  // ---- ultrasonics (periodic) ----
-  static float f_cm = -1, r_cm = -1;
-  unsigned long now = millis();
-  if (now - lastUltra >= ULTRA_MS) {
-    lastUltra = now;
-    f_cm = readCmMedian3(trigFront, echoFront);
-    r_cm = readCmMedian3(trigRight, echoRight);
-
-    // run auton (updates speed/dir/bias)
-    if (auton == AUTON_FOLLOW_ME)      runFollowMe(f_cm);
-    else if (auton == AUTON_RIGHT_WALL) runRightWall(r_cm);
-  }
-
-  // ---- drive ----
-  applyDrive();
-
-  // ---- telemetry ----
-  if (now - lastTele >= TELEMETRY_MS) {
-    lastTele = now;
-    long dL = ticksL, dR = ticksR;
-    ticksL = 0; ticksR = 0;
-
-    // encoders
-    Serial.print("T,");
-    Serial.print(now); Serial.print(',');
-    Serial.print(dL);  Serial.print(',');
-    Serial.println(dR);
-
-    // ultrasonics (ints for readability)
-    Serial.print("U,");
-    Serial.print(now); Serial.print(',');
-    Serial.print((int)f_cm); Serial.print(',');
-    Serial.println((int)r_cm);
-  }
+void loop(){
+  followRulesStep();
 }
-
