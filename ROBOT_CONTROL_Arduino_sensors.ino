@@ -1,139 +1,171 @@
-// ================= Line Following per Rules (3 IR sensors) =================
-// Wiring
+// ============ Line Follower: center + side corrections via TURN_MULT ============
+// Motors
 const int IN1 = 6;  // Left forward
 const int IN2 = 3;  // Left backward
-const int IN3 = 8;  // Right forward
+const int IN3 = 9;  // Right forward
 const int IN4 = 5;  // Right backward
 
-const int IR_C = 2; // Center IR (digital OUT)
-const int IR_L = 7; // Left IR
-const int IR_R = 4; // Right IR
+// IR sensors (digital)
+const int IR_C = 2; // Center
+const int IR_L = 7; // Left
+const int IR_R = 4; // Right
 
-// Most IR boards: HIGH on white, LOW on dark. Flip to false if yours is opposite.
-bool IR_HIGH_MEANS_WHITE = true;
+// IR polarity: if your boards are HIGH on white, set true; if LOW on white, set false.
+bool IR_HIGH_MEANS_WHITE = false;   // change to true if needed after testing
 
-// Motor inversion (set true if a side runs opposite)
+// Motor inversion (flip if that side runs backward when you expect forward)
 bool LEFT_INVERT  = false;
-bool RIGHT_INVERT = true;  // keep as before; flip to false if your right side is correct
+bool RIGHT_INVERT = false;
 
-// Speed / steering shaping
-const unsigned long SPEED_PERIOD_MS = 50; // software PWM period
-unsigned int BASE_DUTY   = 65;            // 55–75 works well
-const unsigned long TURN_PERIOD_MS = 120; // steering slice period
-unsigned int TURN_WIN_PCT = 65;           // slice window (larger = sharper)
-const bool HARD_TURN = false;             // false=stop inner wheel, true=reverse inner (sharper)
+// Software PWM settings (speed control)
+const unsigned long SPEED_PERIOD_MS = 50;
+unsigned int BASE_DUTY   = 30;      // 0..100 (overall speed)
 
-// Debounce for sensor “hits”
-const uint8_t HIT_PERSIST = 2;
+// Turn multiplier: >1.0 = stronger correction
+const float TURN_MULT = 1.5;
 
-// ---------- Motor helpers ----------
+// --- motor helpers ---
 void leftSet(bool fwd){
   if (LEFT_INVERT) fwd = !fwd;
-  if (fwd){ digitalWrite(IN1,HIGH); digitalWrite(IN2,LOW); }
-  else    { digitalWrite(IN1,LOW);  digitalWrite(IN2,HIGH); }
+  digitalWrite(IN1, fwd ? HIGH : LOW);
+  digitalWrite(IN2, fwd ? LOW  : HIGH);
 }
 void rightSet(bool fwd){
   if (RIGHT_INVERT) fwd = !fwd;
-  if (fwd){ digitalWrite(IN3,HIGH); digitalWrite(IN4,LOW); }
-  else    { digitalWrite(IN3,LOW);  digitalWrite(IN4,HIGH); }
+  digitalWrite(IN3, fwd ? HIGH : LOW);
+  digitalWrite(IN4, fwd ? LOW  : HIGH);
 }
-void leftForward(){ leftSet(true); }
-void leftBackward(){ leftSet(false); }
-void rightForward(){ rightSet(true); }
-void rightBackward(){ rightSet(false); }
-void leftStop(){ digitalWrite(IN1,LOW); digitalWrite(IN2,LOW); }
-void rightStop(){ digitalWrite(IN3,LOW); digitalWrite(IN4,LOW); }
-void stopAll(){ leftStop(); rightStop(); }
 
-// ---------- IR reads (true = on WHITE) ----------
+void leftForward()  { leftSet(true);  }
+void leftBackward() { leftSet(false); }
+void rightForward() { rightSet(true); }
+void rightBackward(){ rightSet(false);}
+void leftStop()     { digitalWrite(IN1, LOW); digitalWrite(IN2, LOW); }
+void rightStop()    { digitalWrite(IN3, LOW); digitalWrite(IN4, LOW); }
+void stopAll()      { leftStop(); rightStop(); }
+
+// --- IR read: true = on white ---
 inline bool onWhiteRaw(int pin){
   int v = digitalRead(pin);
-  return IR_HIGH_MEANS_WHITE ? (v==HIGH) : (v==LOW);
+  return IR_HIGH_MEANS_WHITE ? (v == HIGH) : (v == LOW);
 }
-inline bool onC(){ return onWhiteRaw(IR_C); }
-inline bool onL(){ return onWhiteRaw(IR_L); }
-inline bool onR(){ return onWhiteRaw(IR_R); }
 
-// Simple persistence (debounce)
-uint8_t cHit=0,lHit=0,rHit=0;
-bool C=false,L=false,R=false;
+// Simple debounced states
+uint8_t cHit=0, lHit=0, rHit=0;
+bool C=false, L=false, R=false;
+const uint8_t HIT_PERSIST = 2;
 
 void updateSensors(){
-  C = onC() ? (cHit=min<uint8_t>(255, cHit+1), true) : (cHit=0, false);
-  L = onL() ? (lHit=min<uint8_t>(255, lHit+1), true) : (lHit=0, false);
-  R = onR() ? (rHit=min<uint8_t>(255, rHit+1), true) : (rHit=0, false);
-  // require small persistence to count as “on”
+  if (onWhiteRaw(IR_C)) { if (cHit < 255) cHit++; } else cHit = 0;
+  if (onWhiteRaw(IR_L)) { if (lHit < 255) lHit++; } else lHit = 0;
+  if (onWhiteRaw(IR_R)) { if (rHit < 255) rHit++; } else rHit = 0;
+
   C = (cHit >= HIT_PERSIST);
   L = (lHit >= HIT_PERSIST);
   R = (rHit >= HIT_PERSIST);
 }
 
-// ---------- Drive forward with optional steer bias ----------
-void driveForwardSliced(){
-  unsigned long ts = millis() % SPEED_PERIOD_MS;
-  unsigned long on = (SPEED_PERIOD_MS * BASE_DUTY)/100;
-  if (ts <= on){ leftForward(); rightForward(); }
-  else          { stopAll(); }
-}
+// --- main drive step using TURN_MULT everywhere + backward rule ---
+void driveStep(){
+  updateSensors();
 
-// dir: -1 = steer left, +1 = steer right, 0 = straight
-void steerBias(int dir){
-  if (dir == 0) return;
-  unsigned long tt = millis() % TURN_PERIOD_MS;
-  unsigned long win = (TURN_PERIOD_MS * TURN_WIN_PCT)/100;
-  if (tt < win){
-    bool innerLeft = (dir < 0);
-    if (HARD_TURN){
-      if (innerLeft) leftBackward(); else rightBackward();
-    } else {
-      if (innerLeft) leftStop(); else rightStop();
+  float leftDuty  = 0;
+  float rightDuty = 0;
+  bool goingBackward = false;   // NEW: track direction
+
+  // ========== Center OFF (C == false): strong corrections ==========
+  if (!C) {
+    if (L && !R) {
+      // ONLY LEFT sensor: turn LEFT
+      // (we want the robot to pivot left)
+      leftDuty  = BASE_DUTY / TURN_MULT;
+      rightDuty = 0;
+    } 
+    else if (R && !L) {
+      // ONLY RIGHT sensor: turn RIGHT
+      rightDuty = BASE_DUTY / TURN_MULT;
+      leftDuty  = 0;
+    } 
+    else if (L && R) {
+      // Both sides but no center: go straight, slower
+      leftDuty  = BASE_DUTY / TURN_MULT;
+      rightDuty = BASE_DUTY / TURN_MULT;
+    } 
+    else {
+      // NEW RULE: no sensors see anything → back up
+      leftDuty      = BASE_DUTY / TURN_MULT;
+      rightDuty     = BASE_DUTY / TURN_MULT;
+      goingBackward = true;
     }
+  }
+  // ========== Center ON (C == true): soft corrections ==========
+  else {
+    if (!L && !R) {
+      // Center only → straight at base speed
+      leftDuty  = BASE_DUTY;
+      rightDuty = BASE_DUTY;
+    }
+    else if (L && !R) {
+      // Center + LEFT → soft right correction
+      // drifted left, so turn right:
+      leftDuty  = BASE_DUTY * TURN_MULT;    // speed up left
+      rightDuty = BASE_DUTY / TURN_MULT;    // slow right
+    }
+    else if (R && !L) {
+      // Center + RIGHT → soft left correction
+      leftDuty  = BASE_DUTY / TURN_MULT;    // slow left
+      rightDuty = BASE_DUTY * TURN_MULT;    // speed up right
+    }
+    else { // L && R && C
+      // Center + both sides: treat as wide line / crossing → straight
+      leftDuty  = BASE_DUTY;
+      rightDuty = BASE_DUTY;
+    }
+  }
+
+  // Clamp duties to 0..100
+  if (leftDuty  > 100) leftDuty  = 100;
+  if (rightDuty > 100) rightDuty = 100;
+  if (leftDuty  < 0)   leftDuty  = 0;
+  if (rightDuty < 0)   rightDuty = 0;
+
+  // Software PWM per wheel
+  unsigned long ts = millis() % SPEED_PERIOD_MS;
+  unsigned long leftOn  = (unsigned long)(SPEED_PERIOD_MS * (leftDuty  / 100.0));
+  unsigned long rightOn = (unsigned long)(SPEED_PERIOD_MS * (rightDuty / 100.0));
+
+  if (ts < leftOn) {
+    if (goingBackward) leftBackward();
+    else               leftForward();
+  } else {
+    leftStop();
+  }
+
+  if (ts < rightOn) {
+    if (goingBackward) rightBackward();
+    else               rightForward();
+  } else {
+    rightStop();
   }
 }
 
-// ---------- Main behavior (your rules) ----------
-// 1) Move along white line on grey floor.
-// 1.2) Keep center sensor on white; “straighten” if centered.
-// 1.3) If RIGHT sees white, steer RIGHT.
-// 1.4) If LEFT sees white,  steer LEFT.
-// Priority: side sensors override; center keeps straight; if none see white, keep last correction briefly.
-
-int lastDir = 0; // memory when no sensor sees white
-
-void followRulesStep(){
-  updateSensors();
-
-  // Base motion = forward
-  driveForwardSliced();
-
-  // Side sensors override: if R sees white → steer right; if L → steer left
-  if (R && !L){ steerBias(+1); lastDir=+1; return; }
-  if (L && !R){ steerBias(-1); lastDir=-1; return; }
-
-  // If centered on white and sides don’t see white → go straight
-  if (C && !L && !R){ steerBias(0); lastDir=0; return; }
-
-  // If both sides see white (wide/intersection), prefer straight
-  if (L && R){ steerBias(0); lastDir=0; return; }
-
-  // If no sensor currently sees white, nudge toward last known side briefly
-  steerBias(lastDir);
-}
-
 void setup(){
-  pinMode(IN1,OUTPUT); pinMode(IN2,OUTPUT);
-  pinMode(IN3,OUTPUT); pinMode(IN4,OUTPUT);
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
 
-  pinMode(IR_C,INPUT); pinMode(IR_L,INPUT); pinMode(IR_R,INPUT);
+  pinMode(IR_C, INPUT);
+  pinMode(IR_L, INPUT);
+  pinMode(IR_R, INPUT);
 
   stopAll();
   Serial.begin(115200);
-
-  // Quick note: if turning directions feel inverted:
-  //  - swap LEFT_INVERT/RIGHT_INVERT booleans, or
-  //  - swap IR_HIGH_MEANS_WHITE if your boards read LOW on white.
 }
 
 void loop(){
-  followRulesStep();
+  driveStep();
 }
+
+
+
+
+
