@@ -19,7 +19,7 @@ bool RIGHT_INVERT = false;
 
 // Software PWM settings (speed control)
 const unsigned long SPEED_PERIOD_MS = 50;
-unsigned int BASE_DUTY   = 30;      // 0..100 (overall speed)
+unsigned int BASE_DUTY   = 70;      // 0..100 (overall speed)
 
 // Turn multiplier: >1.0 = stronger correction
 const float TURN_MULT = 1.5;
@@ -65,36 +65,80 @@ void updateSensors(){
   R = (rHit >= HIT_PERSIST);
 }
 
-// --- main drive step using TURN_MULT everywhere + backward rule ---
+// ===== NEW: backward → side lock state =====
+bool prevGoingBackward = false;  // were we backing up last frame?
+bool lockActive = false;         // currently ignoring the opposite side?
+int  lockSide   = 0;             // -1 = left locked, +1 = right locked
+
+// --- main drive step using TURN_MULT everywhere + backward rule + lock ---
 void driveStep(){
   updateSensors();
 
+  // Raw sensor snapshot
+  bool C_raw = C;
+  bool L_raw = L;
+  bool R_raw = R;
+
+  // --- detect transition: we WERE backing up, and now see first side-only ---
+  if (prevGoingBackward && !lockActive && !C_raw) {
+    if (L_raw && !R_raw) {
+      lockActive = true;
+      lockSide   = -1; // lock to left
+    } else if (R_raw && !L_raw) {
+      lockActive = true;
+      lockSide   = +1; // lock to right
+    }
+  }
+
+  // --- while locked and center still off, ignore opposite side ---
+  if (lockActive && !C_raw) {
+    if (lockSide == -1) {
+      // trust left, ignore right
+      L = L_raw;
+      R = false;
+    } else if (lockSide == +1) {
+      // trust right, ignore left
+      R = R_raw;
+      L = false;
+    }
+    C = C_raw;  // center is still off here by condition
+  } else {
+    // if center sees line, or no lock: use raw readings and possibly clear lock
+    C = C_raw;
+    L = L_raw;
+    R = R_raw;
+    if (C_raw) {
+      // center found -> exit lock, all rules back to normal
+      lockActive = false;
+      lockSide   = 0;
+    }
+  }
+
   float leftDuty  = 0;
   float rightDuty = 0;
-  bool goingBackward = false;   // NEW: track direction
+  bool goingBackward = false;   // track direction this frame
 
   // ========== Center OFF (C == false): strong corrections ==========
   if (!C) {
     if (L && !R) {
-      // ONLY LEFT sensor: turn LEFT
-      // (we want the robot to pivot left)
-      leftDuty  = BASE_DUTY / TURN_MULT;
+      // ONLY LEFT sensor: turn LEFT (pivot)
+      leftDuty  = BASE_DUTY;
       rightDuty = 0;
     } 
     else if (R && !L) {
-      // ONLY RIGHT sensor: turn RIGHT
-      rightDuty = BASE_DUTY / TURN_MULT;
+      // ONLY RIGHT sensor: turn RIGHT (pivot)
+      rightDuty = BASE_DUTY;
       leftDuty  = 0;
     } 
     else if (L && R) {
-      // Both sides but no center: go straight, slower
-      leftDuty  = BASE_DUTY / TURN_MULT;
-      rightDuty = BASE_DUTY / TURN_MULT;
+      // Both sides but no center: go straight
+      leftDuty  = BASE_DUTY;
+      rightDuty = BASE_DUTY;
     } 
     else {
-      // NEW RULE: no sensors see anything → back up
-      leftDuty      = BASE_DUTY / TURN_MULT;
-      rightDuty     = BASE_DUTY / TURN_MULT;
+      // no sensors see anything → back up
+      leftDuty      = BASE_DUTY;
+      rightDuty     = BASE_DUTY;
       goingBackward = true;
     }
   }
@@ -107,7 +151,6 @@ void driveStep(){
     }
     else if (L && !R) {
       // Center + LEFT → soft right correction
-      // drifted left, so turn right:
       leftDuty  = BASE_DUTY * TURN_MULT;    // speed up left
       rightDuty = BASE_DUTY / TURN_MULT;    // slow right
     }
@@ -147,6 +190,9 @@ void driveStep(){
   } else {
     rightStop();
   }
+
+  // remember whether we were backing up this frame
+  prevGoingBackward = goingBackward;
 }
 
 void setup(){
@@ -164,8 +210,6 @@ void setup(){
 void loop(){
   driveStep();
 }
-
-
 
 
 
